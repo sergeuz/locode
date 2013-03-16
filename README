@@ -1,0 +1,84 @@
+This project is an attempt to provide and maintain internationalized database
+of world countries, their regions, cities and other localities. Contains
+loc2yaml, CSV to YAML converter tool for UN/LOCODE data, which is chosen as
+foundation for such database.
+
+UN/LOCODE homepage:
+http://www.unece.org/cefact/locode/welcome.html
+Recent CSV files can be downloaded here:
+http://www.unece.org/cefact/codesfortrade/codes_index.html
+
+Examples of loc2yaml usage:
+
+loc2yaml unlocode.csv
+    Process all the data of 'unlocode.csv' file and put generated files into
+    default 'country' directory, creating it in current directory if necessary.
+
+loc2yaml -c us,ca -o path/to/yaml/files unlocode.csv
+    Process only data related to USA and Canada, putting generated files into
+    specified directory.
+
+loc2yaml -o world.yaml *.csv
+    Generate single YAML file for all CSV files found in current directory.
+    Note that loc2yaml doesn't support wildcard file names natively.
+
+loc2yaml -m -r -o world.yaml *.yaml
+    Merge all YAML files found in current directory into single file. All
+    content of destination file will be overwritten (see -r flag).
+
+Structure of generated documents:
+
+01 country:
+02   'NO':
+03     name:
+04       default: Norge
+05       en: Norway
+06     region:
+07       NO-01:
+08         name: Østfold
+09         city:
+10           FRK: Fredrikstad
+11           SPG: Sarpsborg
+12       NO-02:
+13         name: No-02 (TODO)
+14       .NONE:
+15         city:
+16           .EMR:
+17             name: Emerald City
+18             loc2yaml: preserve
+
+Format notes:
+
+* Country, region and city codes are case-sensitive (lines 2, 7, 10, 11, 12,
+  16), loc2yaml expects them to be in upper case to update files correctly.
+  Reserved words such as 'name', 'region', etc. should be in lower case.
+* Country codes should comply with 2-letter codes defined in ISO 3166-1
+  standard (line 2).
+* Custom region codes are formally allowed, though should be used only if
+  absolutely necessary. Ensure there are no intersections with standard codes
+  defined in ISO 3166-2 for country subdivisions (lines 7, 12, 14).
+* Custom city codes are allowed for entries missing in source UN/LOCODE data.
+  In above context term 'city' may correspond to any locality within grouping
+  region (lines 10, 11, 16).
+* loc2yaml groups orphane localities using special '.NONE' region code (line
+  14). In most if not all cases such entries should be moved to proper region
+  manually.
+* There are several ways to provide names for countries, regions and cities.
+  In-place naming, where entry name follows its code right at the same line,
+  is supported only for cities (lines 10, 11).
+* Translations to different languages can be provided by expanding 'name'
+  element (lines 3-5). It's recommended to use ISO 639-1 language codes and
+  always provide a "default" translation.
+* When loc2yaml is unable to provide full name, e.g. region names in newly
+  generated files, it uses placeholder name based on locality code with
+  '(TODO)' suffix added to it (line 13).
+* Parser hints (described below) can be provided for loc2yaml to alter its
+  behavior when updating certain entries (line 18).
+
+Parser hints:
+
+* preserve
+  Protects certain entry from deletion when loc2yaml is invoked to update
+  existent YAML file and source UN/LOCODE data doesn't contain such entry
+  anymore. Usually applied to custom entries when loc2yaml is expected to be
+  used with --no-obsolete argument.

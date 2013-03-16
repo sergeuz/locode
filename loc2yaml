@@ -1,0 +1,909 @@
+#!/usr/bin/env python
+
+# loc2yaml, CSV to YAML converter for UN/LOCODE data
+# https://github.com/sergeuz/locode
+#
+# Dependencies: Python 3.2 or higher; pyyaml (https://bitbucket.org/xi/pyyaml)
+# UN/LOCODE homepage: http://www.unece.org/cefact/locode/welcome.html
+#
+# This file is subject to the terms and conditions defined in LICENSE file,
+# which is part of this source code package.
+
+import yaml, csv, shutil, tempfile, datetime, getopt, re, sys, os
+from collections import OrderedDict, namedtuple
+
+# Placeholder region code used when particular location has no region specified.
+# Shouldn't match any of subdivision codes defined by ISO 3166-2
+UNKNOWN_REGION_CODE = ".NONE"
+DEFAULT_OUTPUT_BASENAME = "country"
+PARSER_HINT_TAG = "loc2yaml"
+TODO_MARKER = "(TODO)"
+PROJECT_HOMEPAGE = "https://github.com/sergeuz/locode"
+VERSION_STRING = "0.1.0"
+
+# Supported parser hints
+PARSER_HINT_PRESERVE = "preserve"
+
+class Config:
+    def __init__(self):
+        # Default settings
+        self.src_files = []
+        self.dest_path = DEFAULT_OUTPUT_BASENAME
+        self.dest_is_file = False
+        self.ctry_codes = set() # Country codes
+        self.replace = False
+        self.merge = False
+        self.simplify = False
+        self.no_obs = False
+        self.no_diacr = False
+        self.add_descr = False
+        self.verbose = False
+        self.quiet = False
+        self.safe_args = []
+        self.safe_src_files = []
+
+# Helper structures
+YamlCityProp = namedtuple('YamlCityProp', ['name', 'region', 'flags'])
+CsvLocationProp = namedtuple('CsvLocationProp', ['name', 'region'])
+UpdateStat = namedtuple('Stat', ['added', 'deleted', 'moved', 'conflict', 'todo'])
+
+# Current settings
+cfg = Config()
+
+# Some precompiled regular expressions
+rx_cut = [
+    re.compile(r"\(.*?\)")] # Text within and including parentheses
+rx_skip = [ # See UN/LOCODE manual
+    re.compile(r"\sPt$", re.IGNORECASE), # Port
+    re.compile(r"\sApt$", re.IGNORECASE)] # Airport
+rx_skip_more = [ # These ones are not stated in manual
+    re.compile(r"\sPort$", re.IGNORECASE),
+    re.compile(r"\sAirport$", re.IGNORECASE),
+    re.compile(r"\sTerminal$", re.IGNORECASE)]
+rx_repl = [ # See UN/LOCODE manual
+    (re.compile(r"\bI\.\b", re.IGNORECASE), "Island"),
+    (re.compile(r"\bPto\b", re.IGNORECASE), "Puerto"),
+    (re.compile(r"\bSt\b", re.IGNORECASE), "Saint")]
+
+
+def print_usage():
+	print("""CSV to YAML converter for UN/LOCODE data, version {version}
+{homepage}
+
+Usage:
+    loc2yaml [-c code] [-o path] [-s] file.csv [file.csv ...]
+    loc2yaml -m -o output.yaml file.yaml [file.yaml ...]
+
+Arguments:
+    -c code[,code[,...]]
+    --country=code[,code[,...]]
+        Generate data for specified country codes only. Two-letter codes as
+        defined in ISO 3166-1 are recognized.
+
+    -o path
+    --output=path
+        Use specified directory for generated files, one YAML file per country.
+        If path points to .yaml file (existent or not), generated data for all
+        counties will be stored into single file.
+
+    -r
+    --replace
+        Replace destination files rather than try to update them.
+
+    -m
+    --merge
+        Merge data from separate YAML files into single file. Input files are
+        treated as YAML files in this mode.
+
+    -s
+    --simplify
+        Enable various heuristics in order to simplify location names, filter
+        out certain entries, such as transport nodal points and unverified
+        locations.
+
+    --no-obsolete
+        Remove obsolete entries while updating existent YAML files.
+
+    --no-diacritic
+        Use location names without diacritic signs.
+
+    --add-description
+        Put description of document structure into header of generated YAML
+        files. Can be useful for those who will edit these files manually.
+
+    -v
+    --verbose
+        Print various statistics while processing data.
+
+    -q
+    --quiet
+        Suppress any normal output.
+
+    --version
+        Show version string.
+
+    -h
+    --help
+        Show this message.
+
+Examples:
+    loc2yaml unlocode.csv
+        Process all the data of 'unlocode.csv' file and put generated files
+        into default '{basename}' directory, creating it in current directory if
+        necessary.
+
+    loc2yaml -c us,ca -o path/to/yaml/files unlocode.csv
+        Process only data related to USA and Canada, putting generated files
+        into specified directory.
+
+    loc2yaml -o world.yaml *.csv
+        Generate single YAML file for all CSV files found in current directory.
+        Note that loc2yaml doesn't support wildcard file names natively.
+
+    loc2yaml -m -r -o world.yaml *.yaml
+        Merge all YAML files found in current directory into single file. All
+        content of destination file will be overwritten (see -r flag).
+""".format(
+    homepage=PROJECT_HOMEPAGE,
+    version=VERSION_STRING,
+    basename=DEFAULT_OUTPUT_BASENAME))
+
+
+def print_q(*objs):
+    if not cfg.quiet:
+        print(*objs)
+
+
+def print_v(*objs):
+    if cfg.verbose:
+        print_q(*objs)
+
+
+def simplify_str(s):
+    return ' '.join(s.split())
+
+
+def is_upper_str(s):
+    for c in s:
+        if c.isalpha() and not c.istitle():
+            return False
+    return True
+
+
+def transact_copy(src_dir, dest_dir):
+    files = []
+    # At first step checking if we actually can write all our destination files
+    for name in os.listdir(src_dir):
+        src_file = os.path.abspath(src_dir + '/' + name)
+        if not os.path.isfile(src_file):
+            continue
+        dest_file = os.path.abspath(dest_dir + '/' + name)
+        if not os.path.exists(dest_file) or os.path.isfile(dest_file) and os.access(dest_file, os.W_OK):
+            files.append((src_file, dest_file))
+        else:
+            raise RuntimeError("Unable to write to file: {}".format(dest_file))
+    # Copying files
+    for src_file, dest_file in files:
+        if os.path.exists(dest_file):
+            if cfg.replace:
+                print_q("Replacing file:", dest_file)
+            else:
+                print_q("Updating file:", dest_file) # Actually we always overwrite files
+        else:
+            print_q("Creating file:", dest_file)
+        shutil.copyfile(src_file, dest_file)
+
+
+def parse_cmd_args(argv):
+        global cfg
+
+        opts, cfg.src_files = getopt.getopt(argv[1:], \
+            "c:o:rmsvqh", \
+            ["country=", "output=", "replace", "merge", "simplify", "verbose", "quiet", "help", \
+            "no-obsolete", "no-diacritic", "add-description", "version"]) # No short alternatives
+
+        for opt, arg in opts:
+            if opt in ("-h", "--help"):
+                print_usage();
+                sys.exit();
+            elif opt == "--version":
+                print(VERSION_STRING);
+                sys.exit();
+            elif opt in ("-c", "--country"):
+                for code in arg.split(','):
+                    code = code.strip()
+                    if len(code) == 2:
+                        cfg.ctry_codes.add(code.upper())
+                    elif code:
+                        sys.stderr.write("Warning: \"{}\" doesn't look like ISO 3166-1 country code\n".format(code))
+            elif opt in ("-o", "--output"):
+                cfg.dest_path = arg
+            elif opt in ("-r", "--replace"):
+                cfg.replace = True
+            elif opt in ("-m", "--merge"):
+                cfg.merge = True
+            elif opt in ("-s", "--simplify"):
+                cfg.simplify = True
+            elif opt in ("-v", "--verbose"):
+                cfg.verbose = True
+            elif opt in ("-q", "--quiet"):
+                cfg.quiet = True
+            elif opt == "--no-obsolete":
+                cfg.no_obs = True
+            elif opt == "--no-diacritic":
+                cfg.no_diacr = True
+            elif opt == "--add-description":
+                cfg.add_descr = True
+            else:
+                assert False
+
+            # See save_yml_data()
+            if opt not in ["-o", "--output", "-v", "--verbose", "-q", "--quiet", "--add-description"]:
+                cfg.safe_args.append(opt)
+                if arg:
+                    cfg.safe_args.append(arg)
+
+        # Converting source files to absolute paths
+        for i, v in enumerate(cfg.src_files):
+            cfg.src_files[i] = os.path.abspath(v)
+            cfg.safe_src_files.append(os.path.basename(v)) # Hide path
+
+        if len(cfg.src_files) > 1:
+            print_q("Source files:")
+            for file_name in cfg.src_files:
+                print_q("    {}".format(file_name))
+        elif len(cfg.src_files) == 1:
+            print_q("Source file:", cfg.src_files[0])
+        else:
+            raise RuntimeError("No input files specified.\nTry 'loc2yaml --help' for list of supported options.")
+
+        # Full path to destination file or directory
+        cfg.dest_path = os.path.abspath(cfg.dest_path)
+        if cfg.merge or os.path.isfile(cfg.dest_path) or cfg.dest_path.endswith(".yaml"):
+            if not cfg.dest_path.endswith(".yaml"):
+                cfg.dest_path += ".yaml"
+            print_q("Destination file:", cfg.dest_path)
+            cfg.dest_is_file = True;
+        else:
+            print_q("Destination directory:", cfg.dest_path)
+
+        # Country codes filter
+        if cfg.ctry_codes:
+            print_q("Country codes:", ", ".join(sorted(cfg.ctry_codes)))
+        else:
+            print_q("Using all country codes")
+
+
+def simplify_name(orig_name):
+    loc_name = orig_name
+
+    # Skipping names with sublocations, e.g. "Astoria/Queens/New York"
+    if loc_name.find('/') > -1:
+        return ''
+
+    # Removing any remarks and clarifications:
+    # "Saint Petersburg (ex Leningrad)" -> "Saint Petersburg"
+    for rx in rx_cut:
+        loc_name = rx.sub('', loc_name)
+    loc_name = simplify_str(loc_name)
+
+    # Always using last name met among possible renamings and alternatives.
+    # Sometimes this seems to give an advance to French namings in case of
+    # Canada, for example, but who said format is perfect...
+    # "Peking = Beijing" -> "Beijing"
+    loc_names = loc_name.split('=')
+    if len(loc_names) > 1:
+        loc_name = simplify_str(loc_names[-1])
+
+    # Some names consist of comma-separated parts and situations when this
+    # rule is applied seem to be completely random regardless of what is
+    # said in manual. Here we just merging such parts
+    loc_name = loc_name.replace(',', '')
+    loc_name = simplify_str(loc_name)
+
+    # Skipping subordinate entries, e.g. "London-Heathrow Apt" (for what
+    # they're used if there are also sublocation entries?). These ones are
+    # separated with just hyphen ('-') which makes it impossible to filter
+    # out such locations completely as hyphen can also be a part of regular
+    # city name. What we can do here is filter out locations related to
+    # airports, for example
+    if loc_name.find('-') > -1:
+        # Skipping entry if transport node indentifier (defined in manual),
+        # is met as part of any name's section
+        loc_names = loc_name.split('-')
+        for name in loc_names:
+            for rx in rx_skip:
+                if rx.search(name) != None:
+                    return ''
+        # Our custom filter check is applied only to last section of name
+        # (there are a lot of useful "Port-Whatever" locations)
+        for rx in rx_skip_more:
+            if rx.search(loc_names[-1]) != None:
+                return ''
+    else:
+        # Regular location name: checking only for "official" identifiers,
+        # which we recognize to skip certain entries
+        for rx in rx_skip:
+            if rx.search(loc_name) != None:
+                return ''
+
+    # Expanding abbreviations
+    for rx, repl in rx_repl:
+        loc_name = rx.sub(repl, loc_name)
+
+    return loc_name
+
+
+def parse_csv_file(file_name, out_dict):
+    # Skipped, duplicated, orphane and other suspicious entries
+    skipped = {}
+    dups = {}
+    orphs = {}
+    renames = {}
+
+    print_q("Processing file:", file_name)
+    f = open(file_name, encoding="cp1252", newline='')
+    reader = csv.reader(f)
+
+    # See http://www.unece.org/fileadmin/DAM/cefact/locode/unlocode_manual.pdf
+    for row in reader:
+        if len(row) != 12:
+            raise RuntimeError("Invalid number of fields, line: {}".format(reader.line_num))
+
+        # Country code
+        ctry_code = row[1].strip().upper()
+        if cfg.ctry_codes and ctry_code not in cfg.ctry_codes:
+            continue
+        # Location name
+        if cfg.no_diacr:
+            loc_name = simplify_str(row[4]) # Name without diacritic signs
+        else:
+            loc_name = simplify_str(row[3])
+        region_code = row[5].strip().upper() # Subdivision code
+        loc_code = row[2].strip().upper() # Location code
+        status = row[7].strip().casefold() # Approval status
+
+        # Skipping incomplete entries (usually act as delimiters)
+        if not ctry_code or not loc_code or not loc_name:
+            continue
+
+        orphane = False
+        if not region_code:
+            region_code = UNKNOWN_REGION_CODE
+            orphane = True
+
+        full_code = ctry_code + ' ' + region_code + ' ' + loc_code
+        orig_name = loc_name
+
+        if cfg.simplify:
+            # Simplifying location name
+            loc_name = simplify_name(orig_name)
+            if (not loc_name or
+                status == "xx" or # Will be removed from the next issue of UN/LOCODE
+                status == "ur" or # Included on user's request, not officially approved
+                status == "rr"): # Request rejected
+                skipped.setdefault(full_code, []).append(orig_name)
+                continue
+            if orig_name.find(',') > -1:
+                # Names which originally consisted of comma-separated parts are
+                # likely subjects for further manual renaming
+                renames.setdefault(full_code, []).append(loc_name)
+
+        region_dict = out_dict.setdefault(ctry_code, {})
+        loc_dict = region_dict.setdefault(region_code, {})
+        if loc_code in loc_dict:
+            # Prefer shorter name among duplicate entries
+            loc_cur_name = loc_dict[loc_code]
+            if len(loc_name) < len(loc_cur_name):
+                loc_dict[loc_code] = loc_name
+
+            name_list = dups.setdefault(full_code, [])
+            if not name_list:
+                name_list.append(loc_cur_name)
+            name_list.append(loc_name)
+        else:
+            loc_dict[loc_code] = loc_name
+
+        if orphane:
+            orphs[full_code] = loc_dict[loc_code]
+
+    f.close()
+
+    # Various statistics for further manual processing
+    if skipped:
+        print_v("Skipped entries (--simplify enabled):")
+        for code, names in sorted(skipped.items()):
+            print_v("    {}:".format(code))
+            for name in sorted(names):
+                print_v("        {}".format(name))
+    if renames:
+        print_v("Consider manual renaming (--simplify enabled):")
+        for code, names in sorted(renames.items()):
+            print_v("    {}:".format(code))
+            for name in sorted(names):
+                print_v("        {}".format(name))
+    if orphs:
+        print_v("Orphane entries (no region specified):")
+        for code, name in sorted(orphs.items()):
+            print_v("    {}:".format(code))
+            print_v("        {}".format(name))
+    if dups:
+        print_v("Duplicate entries (shorter names preferred):")
+        for code, names in sorted(dups.items()):
+            print_v("    {}:".format(code))
+            for name in sorted(names):
+                print_v("        {}".format(name))
+
+
+def parse_yml_file(file_name, yml_dest):
+    print_q("Loading file:", file_name)
+    f = open(file_name, 'r')
+    yml_src = yaml.safe_load(f)
+    f.close()
+
+    if "country" not in yml_src:
+        sys.stderr.write("Warning: No country data found, skipping file\n")
+        return
+
+    # Checking if all codes are provided in upper case. Helps mostly with loc2yaml
+    # debugging when certain unquoted node names, such as 'NO' (Norway), are being
+    # converted to other Python types by pyyaml's safe_load() parser, rather than
+    # being represented as strings
+    src_ctry_root = yml_src["country"]
+    for ctry_code, src_ctry in src_ctry_root.items():
+        if len(ctry_code) != 2:
+            sys.stderr.write("Warning: Invalid country code: {}\n".format(ctry_code))
+            continue
+        if not is_upper_str(ctry_code):
+            sys.stderr.write("Warning: Country code contains mixed case letters: {}\n".format(ctry_code))
+        if "region" in src_ctry:
+            for region_code, src_region in src_ctry["region"].items():
+                if not is_upper_str(region_code):
+                    sys.stderr.write("Warning: Region code contains mixed case letters: {}\n".format(region_code))
+                if "city" in src_region:
+                    for city_code in src_region["city"].keys():
+                        if not is_upper_str(city_code):
+                            sys.stderr.write("Warning: City code contains mixed case letters: {}\n".format(city_code))
+
+    if cfg.ctry_codes:
+        # Filtering content by country codes
+        dest_ctry_root = yml_dest["country"]
+        for ctry_code in src_ctry_root:
+            if ctry_code in cfg.ctry_codes: # Upper-case expected
+                dest_ctry_root.setdefault(ctry_code, {}).update(src_ctry_root[ctry_code])
+            else:
+                continue
+    else:
+        yml_dest.update(yml_src)
+
+
+def update_yml_data(yml_data, csv_data):
+    # Update statistics
+    stat_add = []
+    stat_del = []
+    stat_moved = []
+    stat_conf = []
+    stat_todo = False
+
+    yml_ctry_root = yml_data["country"]
+    for csv_ctry_code, csv_region_root in csv_data.items():
+        # YAML's city properties for current country
+        yml_city_prop = {}
+        yml_ctry = yml_ctry_root.setdefault(csv_ctry_code, {})
+        yml_region_root = yml_ctry.setdefault("region", {})
+        for yml_region_code, yml_region in yml_region_root.items():
+            if "city" not in yml_region:
+                continue
+            for yml_city_code, yml_city in yml_region["city"].items():
+                # City name (can be specified in different ways)
+                name = ''
+                if type(yml_city) == type({}):
+                    if "name" in yml_city:
+                        yml_city_name = yml_city["name"]
+                        if type(yml_city_name) == type({}):
+                            if "default" in yml_city_name:
+                                # Default translation:
+                                # MOW:
+                                #   name:
+                                #     default: Moscow
+                                name = yml_city_name["default"]
+                        elif type(yml_city_name) == type(''):
+                            # Separate element:
+                            # MOW:
+                            #   name: Moscow
+                            name = yml_city_name
+                elif type(yml_city) == type(''):
+                    # In-place naming:
+                    # MOW: Moscow
+                    name = yml_city
+
+                # Hint flags for loc2yaml, e.g. ".loc2yaml: preserve"
+                flags = set()
+                if type(yml_city) == type({}) and PARSER_HINT_TAG in yml_city:
+                    for flag in yml_city[PARSER_HINT_TAG].split(','):
+                        flag = flag.strip().casefold()
+                        if flag:
+                            flags.add(flag)
+
+                # Updating city properties table
+                yml_city_prop[yml_city_code] = YamlCityProp(name=name, region=yml_region_code, flags=flags)
+
+        # Providing placeholder for default country name if necessary
+        if "name" not in yml_ctry or not yml_ctry["name"]:
+            # TODO: Actually original CSV files seem to contain country names in English
+            yml_ctry["name"] = csv_ctry_code.capitalize() + ' ' + TODO_MARKER
+            stat_todo = True # Some names need to be provided externally
+
+        # Adding new locations; filling default names
+        csv_loc_prop = {}
+        for csv_region_code, csv_city_root in csv_region_root.items():
+            yml_region = yml_region_root.setdefault(csv_region_code, {})
+            if "name" not in yml_region or not yml_region["name"]:
+                if csv_region_code == UNKNOWN_REGION_CODE:
+                    yml_region["name"] = "Unknown " + TODO_MARKER
+                else:
+                    yml_region["name"] = csv_region_code.capitalize() + ' ' + TODO_MARKER # Cannot know full region name
+                stat_todo = True
+
+            yml_city_root = yml_region.setdefault("city", {})
+            for csv_loc_code, csv_loc_name in csv_city_root.items():
+                # Updating location properties table
+                csv_loc_prop[csv_loc_code] = CsvLocationProp(name=csv_loc_name, region=csv_region_code)
+                if csv_loc_code in yml_city_root:
+                    # Checking if existent location has default name associated
+                    yml_city = yml_city_root[csv_loc_code]
+                    if type(yml_city) == type({}):
+                        if "name" in yml_city:
+                            yml_city_name = yml_city["name"]
+                            if type(yml_city_name) == type({}):
+                                if "default" not in yml_city_name or not yml_city_name["default"]:
+                                    yml_city_name["default"] = csv_loc_name # Default translation
+                            elif type(yml_city_name) == type('') and not yml_city_name or type(yml_city_name) == type(None):
+                                yml_city_name = csv_loc_name # Separate element
+                        else:
+                            yml_city["name"] = csv_loc_name # Separate element
+                    elif type(yml_city) == type('') and not yml_city or type(yml_city) == type(None):
+                        yml_city = csv_loc_name # In-place naming
+                elif csv_loc_code in yml_city_prop:
+                    # Location exists in YAML but belongs to different region
+                    yml_city = yml_city_prop[csv_loc_code]
+                    full_code_yml = csv_ctry_code + ' ' + yml_city.region + ' ' + csv_loc_code
+                    full_code_csv = csv_ctry_code + ' ' + csv_region_code + ' ' + csv_loc_code
+                    if yml_city.region == UNKNOWN_REGION_CODE:
+                        if PARSER_HINT_PRESERVE not in yml_city.flags:
+                            # Moving YAML's city to another region only if its current region is not specified
+                            yml_city_root[csv_loc_code] = yml_region_root[yml_city.region]["city"].pop(csv_loc_code)
+                            stat_moved.append((full_code_yml, full_code_csv, yml_city.name)) # Update statistics
+                    elif csv_region_code != UNKNOWN_REGION_CODE:
+                        # CSV and YAML contain same location in different regions
+                        stat_conf.append((full_code_yml, full_code_csv, yml_city.name))
+                else:
+                    # Adding new location
+                    yml_city_root[csv_loc_code] = csv_loc_name # In-place naming
+                    full_code = csv_ctry_code + ' ' + csv_region_code + ' ' + csv_loc_code
+                    stat_add.append((full_code, csv_loc_name)) # Update statistics
+
+        # Removing obsolete locations if requested
+        if cfg.no_obs:
+            for yml_city_code, yml_city in yml_city_prop.items():
+                if yml_city_code not in csv_loc_prop and PARSER_HINT_PRESERVE not in yml_city.flags:
+                    del yml_region_root[yml_city.region]["city"][yml_city_code]
+                    full_code = csv_ctry_code + ' ' + yml_city.region + ' ' + yml_city_code
+                    stat_del.append((full_code, yml_city.name)) # Update statistics
+
+    return UpdateStat(added=stat_add, deleted=stat_del, moved=stat_moved, conflict=stat_conf, todo=stat_todo)
+
+
+def arrange_yml_nodes(yml_data):
+    if type(yml_data) != type({}):
+        return yml_data;
+
+    # Nodes to appear at first place
+    head = ["name", "default", PARSER_HINT_TAG]
+    # And ones to be placed at the end
+    tail = ["region", "city", UNKNOWN_REGION_CODE]
+
+    res = OrderedDict()
+    for key in head:
+        if key in yml_data:
+            res[key] = arrange_yml_nodes(yml_data[key])
+    for key, val in sorted(yml_data.items()): # Other nodes come in sorted order
+        if key not in head and key not in tail:
+            res[key] = arrange_yml_nodes(val)
+    for key in tail:
+        if key in yml_data:
+            res[key] = arrange_yml_nodes(yml_data[key])
+
+    return res
+
+
+def save_yml_file(yml_data, file_name):
+    f = open(file_name, 'w', encoding="utf-8", newline='\n')
+
+    # Header text
+    f.write("""# Generated by loc2yaml {version},
+# CSV to YAML converter for UN/LOCODE data:
+# {homepage}
+#
+# Last updated: {timestamp} (UTC)
+# Command-line arguments: {args}
+# Source files: {files}
+#
+# UN/LOCODE homepage:
+# http://www.unece.org/cefact/locode/welcome.html
+""".format(
+    version=VERSION_STRING,
+    homepage=PROJECT_HOMEPAGE,
+    timestamp=datetime.datetime.utcnow().strftime("%Y-%m-%d, %H:%M:%S"),
+    args=' '.join(cfg.safe_args),
+    files=";\n# ".join(cfg.safe_src_files)))
+
+    # Some hints for those who will update file manually
+    if cfg.add_descr:
+        f.write("""#
+# Document structure (http://en.wikipedia.org/wiki/YAML):
+#
+# 01 country:
+# 02   'NO':
+# 03     name:
+# 04       default: Norge
+# 05       en: Norway
+# 06     region:
+# 07       NO-01:
+# 08         name: Østfold
+# 09         city:
+# 10           FRK: Fredrikstad
+# 11           SPG: Sarpsborg
+# 12       NO-02:
+# 13         name: No-02 {todo}
+# 14       {no_region}:
+# 15         city:
+# 16           .EMR:
+# 17             name: Emerald City
+# 18             {hint_tag}: {hint_preserve}
+#
+# Format notes:
+#
+# * Country, region and city codes are case-sensitive (lines 2, 7, 10, 11, 12,
+#   16), loc2yaml expects them to be in upper case to update files correctly.
+#   Reserved words such as 'name', 'region', etc. should be in lower case.
+# * Country codes should comply with 2-letter codes defined in ISO 3166-1
+#   standard (line 2).
+# * Custom region codes are formally allowed, though should be used only if
+#   absolutely necessary. Ensure there are no intersections with standard codes
+#   defined in ISO 3166-2 for country subdivisions (lines 7, 12, 14).
+# * Custom city codes are allowed for entries missing in source UN/LOCODE data.
+#   In above context term 'city' may correspond to any locality within grouping
+#   region (lines 10, 11, 16).
+# * loc2yaml groups orphane localities using special '{no_region}' region code
+#   (line 14). In most if not all cases such entries should be moved to proper
+#   region manually.
+# * There are several ways to provide names for countries, regions and cities.
+#   In-place naming, where entry name follows its code right at the same line,
+#   is supported only for cities (lines 10, 11).
+# * Translations to different languages can be provided by expanding 'name'
+#   element (lines 3-5). It's recommended to use ISO 639-1 language codes and
+#   always provide a "default" translation.
+# * When loc2yaml is unable to provide full name, e.g. region names in newly
+#   generated files, it uses placeholder name based on locality code with
+#   '{todo}' suffix added to it (line 13).
+# * Parser hints (described below) can be provided for loc2yaml to alter its
+#   behavior when updating certain entries (line 18).
+#
+# Parser hints:
+#
+# * {hint_preserve}
+#   Protects certain entry from deletion when loc2yaml is invoked to update
+#   existent YAML file and source UN/LOCODE data doesn't contain such entry
+#   anymore. Usually applied to custom entries when loc2yaml is expected to be
+#   used with --no-obsolete argument.
+""".format(
+    no_region=UNKNOWN_REGION_CODE,
+    todo=TODO_MARKER,
+    hint_tag=PARSER_HINT_TAG,
+    hint_preserve=PARSER_HINT_PRESERVE))
+
+    f.write('\n')
+    f.write(yaml.safe_dump(arrange_yml_nodes(yml_data), # Order YAML nodes in specific manner
+        allow_unicode=True, default_flow_style=False))
+    f.close()
+
+
+def do_gen():
+    # Parsing all CSV files into single dictionary
+    csv_data = {}
+    for file in cfg.src_files:
+        parse_csv_file(file, csv_data)
+
+    # Working either with all countries found in CSV files (if no country
+    # filter enabled) or only with specified country codes
+    if cfg.ctry_codes:
+        ctry_codes = cfg.ctry_codes & csv_data.keys()
+        missing = cfg.ctry_codes - csv_data.keys()
+        if missing:
+            sys.stderr.write("Warning: Country codes not found in CSV data: {}\n".format(", ".join(sorted(missing))))
+    else:
+        ctry_codes = set(csv_data.keys())
+
+    # Getting names of existent YAML files if necessary
+    yml_files = []
+    if not cfg.replace:
+        if not cfg.dest_is_file:
+            if ctry_codes:
+                for ctry_code in ctry_codes:
+                    yml_file = cfg.dest_path + '/' + ctry_code.casefold() + ".yaml"
+                    if os.path.isfile(yml_file):
+                        yml_files.append(yml_file)
+            elif os.path.isdir(cfg.dest_path):
+                for file_name in os.listdir(cfg.dest_path):
+                    if not file_name.endswith(".yaml") or len(file_name) != 7: # XX.yaml, where XX is 2-letter code
+                        continue
+                    file_name = cfg.dest_path + '/' + file_name
+                    if os.path.isfile(file_name):
+                        yml_files.append(file_name)
+        elif os.path.isfile(cfg.dest_path):
+            yml_files.append(cfg.dest_path)
+
+    # Parsing all YAML files into single dictionary
+    yml_data = {"country": {}}
+    for file_name in yml_files:
+        parse_yml_file(file_name, yml_data)
+
+    print_q("Generating data...")
+    stat = update_yml_data(yml_data, csv_data) # Go!
+
+    # Ensure destination path is exist
+    dest_path = cfg.dest_path
+    if cfg.dest_is_file:
+        dest_path = os.path.dirname(dest_path)
+    if not os.path.exists(dest_path):
+        os.makedirs(dest_path)
+    elif not os.path.isdir(dest_path):
+        raise RuntimeError("Destination path is not a directory: {}".format(dest_path))
+
+    # All destination files are created in temporary directory first
+    temp_dir = tempfile.TemporaryDirectory()
+
+    if not cfg.dest_is_file:
+        # Saving each country data into separate YAML file
+        for ctry_code, yml_ctry in yml_data["country"].items():
+            if len(ctry_code) != 2:
+                continue # Strange country entries are not going to be saved as separate file
+            save_yml_file({"country": {ctry_code: yml_ctry}}, temp_dir.name + '/' + ctry_code.lower() + ".yaml")
+    else:
+        # Saving everything into single YAML file
+        save_yml_file(yml_data, temp_dir.name + '/' + os.path.basename(cfg.dest_path))
+
+    # Finally copying all generated files into specified destination directory
+    transact_copy(temp_dir.name, dest_path)
+
+    # Printing update summary
+    if yml_files:
+        if stat.added:
+            print_v("Added locations:")
+            for code, name in sorted(stat.added):
+                print_v("    {}:".format(code))
+                print_v("        {}".format(name))
+        if stat.deleted:
+            print_v("Removed locations (--no-obsolete enabled):")
+            for code, name in sorted(stat.deleted):
+                print_v("    {}:".format(code))
+                print_v("        {}".format(name))
+        if stat.moved:
+            print_v("Locations moved to another region:")
+            for code_src, code_dest, name in sorted(stat.moved):
+                print_v("    {} -> {}:".format(code_src, code_dest))
+                print_v("        {}".format(name))
+        if stat.conflict:
+            print_v("Locations with conflicting regions:")
+            for code_yml, code_csv, name in sorted(stat.conflict):
+                print_v("    {}, UN/LOCODE: {}".format(code_yml, code_csv))
+                print_v("        {}".format(name))
+    if stat.todo:
+        sys.stderr.write("""Warning: Some entry names are missing and should be provided manually, search
+for {} marker in generated file contents.\n""".format(TODO_MARKER))
+
+    if stat.added:
+        print_q("Summary: Added {} new location(s).".format(len(stat.added)))
+    else:
+        print_q("Summary: No new locations.")
+    if stat.deleted:
+        print_q("Removed {} obsolete location(s).".format(len(stat.deleted)))
+
+
+def do_merge():
+    # Parsing all YAML files into single dictionary
+    yml_src_data = {"country": {}}
+    for file_name in cfg.src_files:
+        parse_yml_file(file_name, yml_src_data)
+
+    if cfg.ctry_codes:
+        missing = cfg.ctry_codes - yml_src_data["country"].keys()
+        if missing:
+            sys.stderr.write("Warning: Country codes not found in YAML data: {}\n".format(", ".join(sorted(missing))))
+
+    if not cfg.replace and os.path.isfile(cfg.dest_path):
+        yml_dest_data = {"country": {}}
+        parse_yml_file(cfg.dest_path, yml_dest_data)
+        print_q("Merging data...")
+        yml_dest_data.update(yml_src_data)
+    else:
+        yml_dest_data = yml_src_data
+
+    # Ensure destination path is exist
+    assert cfg.dest_is_file
+    dest_path = os.path.dirname(cfg.dest_path)
+    if not os.path.exists(dest_path):
+        os.makedirs(dest_path)
+    elif not os.path.isdir(dest_path):
+        raise RuntimeError("Destination path is not a directory: {}".format(dest_path))
+
+    # Creating target file in temporary directory first
+    temp_dir = tempfile.TemporaryDirectory()
+    # Saving everything into single YAML file
+    save_yml_file(yml_dest_data, temp_dir.name + '/' + os.path.basename(cfg.dest_path))
+
+    # Finally copying all generated files into specified destination directory
+    transact_copy(temp_dir.name, dest_path)
+
+
+# Representer function for pyyaml used to dump OrderedDict objects. Basically a
+# copy-paste of BaseRepresenter.represent_mapping() without using sort()
+def represent_odict(dump, tag, mapping, flow_style = None):
+    value = []
+    node = yaml.MappingNode(tag, value, flow_style=flow_style)
+    if dump.alias_key is not None:
+        dump.represented_objects[dump.alias_key] = node
+    best_style = True
+    if hasattr(mapping, 'items'):
+        mapping = mapping.items()
+    for item_key, item_value in mapping:
+        node_key = dump.represent_data(item_key)
+        node_value = dump.represent_data(item_value)
+        if not (isinstance(node_key, yaml.ScalarNode) and not node_key.style):
+            best_style = False
+        if not (isinstance(node_value, yaml.ScalarNode) and not node_value.style):
+            best_style = False
+        value.append((node_key, node_value))
+    if flow_style is None:
+        if dump.default_flow_style is not None:
+            node.flow_style = dump.default_flow_style
+        else:
+            node.flow_style = best_style
+    return node
+
+
+def main(argv):
+    try:
+        # Parsing command-line arguments
+        parse_cmd_args(argv)
+
+        # Installing our custom representer for OrderedDict objects
+        yaml.SafeDumper.add_representer(OrderedDict,
+            lambda dump, val: represent_odict(dump, "tag:yaml.org,2002:map", val))
+
+        if not cfg.merge:
+            do_gen() # Parse CSV files and create/update YAML files
+        else:
+            do_merge() # Merge existent YAML files into single file
+
+    except getopt.GetoptError:
+        print_usage()
+        sys.exit(1)
+    except FileNotFoundError as e:
+        sys.stderr.write("Error: Unable to open file: {}\n".format(e.filename))
+        sys.exit(1)
+    except yaml.parser.ParserError as e:
+        mark = e.problem_mark
+        sys.stderr.write("Error: Unable to parse YAML file: {}, line {}: {}\n".format(mark.name, mark.line + 1, e.problem))
+        sys.exit(1)
+    except yaml.YAMLError as e:
+        sys.stderr.write("Error: Unable to process YAML data: {}\n".format(e))
+        sys.exit(1)
+    except RuntimeError as e:
+        sys.stderr.write("Error: {}\n".format(e))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main(sys.argv)
