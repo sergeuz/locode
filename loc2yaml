@@ -16,13 +16,14 @@ from collections import OrderedDict, namedtuple
 # Shouldn't match any of subdivision codes defined by ISO 3166-2
 UNKNOWN_REGION_CODE = ".NONE"
 DEFAULT_OUTPUT_BASENAME = "country"
-PARSER_HINT_TAG = "loc2yaml"
+PARSER_HINT_TAG = "flags"
 TODO_MARKER = "(TODO)"
 PROJECT_HOMEPAGE = "https://github.com/sergeuz/locode"
 VERSION_STRING = "0.1.0"
 
 # Supported parser hints
 PARSER_HINT_PRESERVE = "preserve"
+PARSER_HINT_ODD = "odd" # Not recognized actually, see "Document structure"
 
 class Config:
     def __init__(self):
@@ -55,7 +56,8 @@ rx_cut = [
     re.compile(r"\(.*?\)")] # Text within and including parentheses
 rx_skip = [ # See UN/LOCODE manual
     re.compile(r"\sPt$", re.IGNORECASE), # Port
-    re.compile(r"\sApt$", re.IGNORECASE)] # Airport
+    re.compile(r"\sApt$", re.IGNORECASE), # Airport
+    re.compile(r"\sFPSO$", re.IGNORECASE)] # Floating Production Storage and Offloading (not in manual)
 rx_skip_more = [ # These ones are not stated in manual
     re.compile(r"\sPort$", re.IGNORECASE),
     re.compile(r"\sAirport$", re.IGNORECASE),
@@ -660,7 +662,7 @@ def save_yml_file(yml_data, file_name):
 # 15         city:
 # 16           .EMR:
 # 17             name: Emerald City
-# 18             {hint_tag}: {hint_preserve}
+# 18             {hint_tag}: {hint_preserve}, {hint_odd}
 #
 # Format notes:
 #
@@ -688,8 +690,8 @@ def save_yml_file(yml_data, file_name):
 # * When loc2yaml is unable to provide full name, e.g. region names in newly
 #   generated files, it uses placeholder name based on locality code with
 #   '{todo}' suffix added to it (line 13).
-# * Parser hints (described below) can be provided for loc2yaml to alter its
-#   behavior when updating certain entries (line 18).
+# * Comma-separated list of parser hints (described below) can be provided for
+#   loc2yaml to alter its behavior when updating certain entries (line 18).
 #
 # Parser hints:
 #
@@ -698,11 +700,16 @@ def save_yml_file(yml_data, file_name):
 #   existent YAML file and source UN/LOCODE data doesn't contain such entry
 #   anymore. Usually applied to custom entries when loc2yaml is expected to be
 #   used with --no-obsolete argument.
+# * {hint_odd}
+#   Not recognized by loc2yaml directly, but can be useful to mark undesirable
+#   entries for target applications. Being simply removed such entries likely
+#   will be restored on next updating invocation of loc2yaml.
 """.format(
     no_region=UNKNOWN_REGION_CODE,
     todo=TODO_MARKER,
     hint_tag=PARSER_HINT_TAG,
-    hint_preserve=PARSER_HINT_PRESERVE))
+    hint_preserve=PARSER_HINT_PRESERVE,
+    hint_odd=PARSER_HINT_ODD))
 
     f.write('\n')
     f.write(yaml.safe_dump(arrange_yml_nodes(yml_data), # Order YAML nodes in specific manner

@@ -45,7 +45,7 @@ Structure of generated documents:
 15         city:
 16           .EMR:
 17             name: Emerald City
-18             loc2yaml: preserve
+18             flags: preserve, odd
 
 Format notes:
 
@@ -73,8 +73,8 @@ Format notes:
 * When loc2yaml is unable to provide full name, e.g. region names in newly
   generated files, it uses placeholder name based on locality code with
   '(TODO)' suffix added to it (line 13).
-* Parser hints (described below) can be provided for loc2yaml to alter its
-  behavior when updating certain entries (line 18).
+* Comma-separated list of parser hints (described below) can be provided for
+  loc2yaml to alter its behavior when updating certain entries (line 18).
 
 Parser hints:
 
@@ -83,3 +83,7 @@ Parser hints:
   existent YAML file and source UN/LOCODE data doesn't contain such entry
   anymore. Usually applied to custom entries when loc2yaml is expected to be
   used with --no-obsolete argument.
+* odd
+  Not recognized by loc2yaml directly, but can be useful to mark undesirable
+  entries for target applications. Being simply removed such entries likely
+  will be restored on next updating invocation of loc2yaml.
