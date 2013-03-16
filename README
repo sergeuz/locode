@@ -34,13 +34,13 @@ Structure of generated documents:
 04       default: Norge
 05       en: Norway
 06     region:
-07       NO-01:
+07       '01':
 08         name: Østfold
 09         city:
 10           FRK: Fredrikstad
 11           SPG: Sarpsborg
-12       NO-02:
-13         name: No-02 (TODO)
+12       '02':
+13         name: 02 (TODO)
 14       .NONE:
 15         city:
 16           .EMR:
@@ -55,8 +55,9 @@ Format notes:
 * Country codes should comply with 2-letter codes defined in ISO 3166-1
   standard (line 2).
 * Custom region codes are formally allowed, though should be used only if
-  absolutely necessary. Ensure there are no intersections with standard codes
-  defined in ISO 3166-2 for country subdivisions (lines 7, 12, 14).
+  absolutely necessary. Ensure there are no intersections with codes defined
+  in ISO 3166-2 for country subdivisions (lines 7, 12, 14). Note that these
+  standard subdivision codes are used without redundant country prefix.
 * Custom city codes are allowed for entries missing in source UN/LOCODE data.
   In above context term 'city' may correspond to any locality within grouping
   region (lines 10, 11, 16).
