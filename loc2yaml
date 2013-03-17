@@ -52,20 +52,21 @@ UpdateStat = namedtuple('Stat', ['added', 'deleted', 'moved', 'conflict', 'todo'
 cfg = Config()
 
 # Some precompiled regular expressions
-rx_cut = [
+re_cut = [
     re.compile(r"\(.*?\)")] # Text within and including parentheses
-rx_skip = [ # See UN/LOCODE manual
+re_skip = [ # See UN/LOCODE manual
     re.compile(r"\sPt$", re.IGNORECASE), # Port
     re.compile(r"\sApt$", re.IGNORECASE), # Airport
     re.compile(r"\sFPSO$", re.IGNORECASE)] # Floating Production Storage and Offloading (not in manual)
-rx_skip_more = [ # These ones are not stated in manual
+re_skip_more = [ # These ones are not stated in manual
     re.compile(r"\sPort$", re.IGNORECASE),
     re.compile(r"\sAirport$", re.IGNORECASE),
     re.compile(r"\sTerminal$", re.IGNORECASE)]
-rx_repl = [ # See UN/LOCODE manual
+re_repl = [ # See UN/LOCODE manual
     (re.compile(r"\bI\.\b", re.IGNORECASE), "Island"),
     (re.compile(r"\bPto\b", re.IGNORECASE), "Puerto"),
     (re.compile(r"\bSt\b", re.IGNORECASE), "Saint")]
+re_dash = re.compile(r"\s-")
 
 
 def print_usage():
@@ -199,51 +200,62 @@ def transact_copy(src_dir, dest_dir):
 def parse_cmd_args(argv):
         global cfg
 
-        opts, cfg.src_files = getopt.getopt(argv[1:], \
+        # Parse supported arguments
+        args, cfg.src_files = getopt.getopt(argv[1:], \
             "c:o:rmsvqh", \
             ["country=", "output=", "replace", "merge", "simplify", "verbose", "quiet", "help", \
             "no-obsolete", "no-diacritic", "add-description", "version"]) # No short alternatives
 
-        for opt, arg in opts:
-            if opt in ("-h", "--help"):
+        # Arguments we don't want to disclose, see save_yml_file()
+        param_unsafe = ["-o", "--output", "-v", "--verbose", "-q", "--quiet"]
+        # Arguments not supported in merge mode. Just to warn those who expects the opposite
+        param_no_merge = ["-s", "--simplify", "--no-obsolete", "--no-diacritic"]
+
+        for param, val in args:
+            if param in ("-h", "--help"):
                 print_usage();
                 sys.exit();
-            elif opt == "--version":
+            elif param == "--version":
                 print(VERSION_STRING);
                 sys.exit();
-            elif opt in ("-c", "--country"):
-                for code in arg.split(','):
+            elif param in ("-c", "--country"):
+                for code in val.split(','):
                     code = code.strip()
                     if len(code) == 2:
                         cfg.ctry_codes.add(code.upper())
                     elif code:
                         sys.stderr.write("Warning: \"{}\" doesn't look like ISO 3166-1 country code\n".format(code))
-            elif opt in ("-o", "--output"):
-                cfg.dest_path = arg
-            elif opt in ("-r", "--replace"):
+            elif param in ("-o", "--output"):
+                cfg.dest_path = val
+            elif param in ("-r", "--replace"):
                 cfg.replace = True
-            elif opt in ("-m", "--merge"):
+            elif param in ("-m", "--merge"):
                 cfg.merge = True
-            elif opt in ("-s", "--simplify"):
+            elif param in ("-s", "--simplify"):
                 cfg.simplify = True
-            elif opt in ("-v", "--verbose"):
+            elif param in ("-v", "--verbose"):
                 cfg.verbose = True
-            elif opt in ("-q", "--quiet"):
+            elif param in ("-q", "--quiet"):
                 cfg.quiet = True
-            elif opt == "--no-obsolete":
+            elif param == "--no-obsolete":
                 cfg.no_obs = True
-            elif opt == "--no-diacritic":
+            elif param == "--no-diacritic":
                 cfg.no_diacr = True
-            elif opt == "--add-description":
+            elif param == "--add-description":
                 cfg.add_descr = True
             else:
                 assert False
 
-            # See save_yml_data()
-            if opt not in ["-o", "--output", "-v", "--verbose", "-q", "--quiet", "--add-description"]:
-                cfg.safe_args.append(opt)
-                if arg:
-                    cfg.safe_args.append(arg)
+            # See save_yml_file()
+            if param not in param_unsafe:
+                cfg.safe_args.append(param)
+                if val:
+                    cfg.safe_args.append(val)
+
+        if cfg.merge:
+            for param, _ in args:
+                if param in param_no_merge:
+                    sys.stderr.write("Warning: \"{}\" has no effect in merge mode\n".format(param))
 
         # Converting source files to absolute paths
         for i, v in enumerate(cfg.src_files):
@@ -283,10 +295,14 @@ def simplify_name(orig_name):
     if loc_name.find('/') > -1:
         return ''
 
+    # Assuming space-separated dash can't be a part of regular locality name
+    if re_dash.search(loc_name) != None:
+        return ''
+
     # Removing any remarks and clarifications:
     # "Saint Petersburg (ex Leningrad)" -> "Saint Petersburg"
-    for rx in rx_cut:
-        loc_name = rx.sub('', loc_name)
+    for re in re_cut:
+        loc_name = re.sub('', loc_name)
     loc_name = simplify_str(loc_name)
 
     # Always using last name met among possible renamings and alternatives.
@@ -314,24 +330,24 @@ def simplify_name(orig_name):
         # is met as part of any name's section
         loc_names = loc_name.split('-')
         for name in loc_names:
-            for rx in rx_skip:
-                if rx.search(name) != None:
+            for re in re_skip:
+                if re.search(name) != None:
                     return ''
         # Our custom filter check is applied only to last section of name
         # (there are a lot of useful "Port-Whatever" locations)
-        for rx in rx_skip_more:
-            if rx.search(loc_names[-1]) != None:
+        for re in re_skip_more:
+            if re.search(loc_names[-1]) != None:
                 return ''
     else:
         # Regular location name: checking only for "official" identifiers,
         # which we recognize to skip certain entries
-        for rx in rx_skip:
-            if rx.search(loc_name) != None:
+        for re in re_skip:
+            if re.search(loc_name) != None:
                 return ''
 
     # Expanding abbreviations
-    for rx, repl in rx_repl:
-        loc_name = rx.sub(repl, loc_name)
+    for re, repl in re_repl:
+        loc_name = re.sub(repl, loc_name)
 
     return loc_name
 
@@ -415,26 +431,19 @@ def parse_csv_file(file_name, out_dict):
     if skipped:
         print_v("Skipped entries (--simplify enabled):")
         for code, names in sorted(skipped.items()):
-            print_v("    {}:".format(code))
-            for name in sorted(names):
-                print_v("        {}".format(name))
+            print_v("    {}: {}".format(code, "; ".join(sorted(names))))
     if renames:
         print_v("Consider manual renaming (--simplify enabled):")
         for code, names in sorted(renames.items()):
-            print_v("    {}:".format(code))
-            for name in sorted(names):
-                print_v("        {}".format(name))
+            print_v("    {}: {}".format(code, "; ".join(sorted(names))))
     if orphs:
         print_v("Orphane entries (no region specified):")
         for code, name in sorted(orphs.items()):
-            print_v("    {}:".format(code))
-            print_v("        {}".format(name))
+            print_v("    {}: {}".format(code, name))
     if dups:
         print_v("Duplicate entries (shorter names preferred):")
         for code, names in sorted(dups.items()):
-            print_v("    {}:".format(code))
-            for name in sorted(names):
-                print_v("        {}".format(name))
+            print_v("    {}: {}".format(code, "; ".join(sorted(names))))
 
 
 def parse_yml_file(file_name, yml_dest):
@@ -790,33 +799,29 @@ def do_gen():
         if stat.added:
             print_v("Added locations:")
             for code, name in sorted(stat.added):
-                print_v("    {}:".format(code))
-                print_v("        {}".format(name))
+                print_v("    {}: {}".format(code, name))
         if stat.deleted:
             print_v("Removed locations (--no-obsolete enabled):")
             for code, name in sorted(stat.deleted):
-                print_v("    {}:".format(code))
-                print_v("        {}".format(name))
+                print_v("    {}: {}".format(code, name))
         if stat.moved:
             print_v("Locations moved to another region:")
             for code_src, code_dest, name in sorted(stat.moved):
-                print_v("    {} -> {}:".format(code_src, code_dest))
-                print_v("        {}".format(name))
+                print_v("    {} -> {}: {}".format(code_src, code_dest, name))
         if stat.conflict:
             print_v("Locations with conflicting regions:")
             for code_yml, code_csv, name in sorted(stat.conflict):
-                print_v("    {}, UN/LOCODE: {}".format(code_yml, code_csv))
-                print_v("        {}".format(name))
+                print_v("    {}, {} (UN/LOCODE): {}".format(code_yml, code_csv, name))
     if stat.todo:
         sys.stderr.write("""Warning: Some entry names are missing and should be provided manually, search
 for {} marker in generated file contents.\n""".format(TODO_MARKER))
 
     if stat.added:
-        print_q("Summary: Added {} new location(s).".format(len(stat.added)))
+        print_q("Summary: Added {} new location(s)".format(len(stat.added)))
     else:
-        print_q("Summary: No new locations.")
+        print_q("Summary: No new locations")
     if stat.deleted:
-        print_q("Removed {} obsolete location(s).".format(len(stat.deleted)))
+        print_q("Removed {} obsolete location(s)".format(len(stat.deleted)))
 
 
 def do_merge():
