@@ -3,33 +3,24 @@
 # loc2yaml, CSV to YAML converter for UN/LOCODE data
 # https://github.com/sergeuz/locode
 #
-# Dependencies: Python 3.2 or higher; pyyaml (https://bitbucket.org/xi/pyyaml)
-# UN/LOCODE homepage: http://www.unece.org/cefact/locode/welcome.html
+# Dependencies:
+# Python 3.2 or higher;
+# pyyaml, https://bitbucket.org/xi/pyyaml
 #
 # This file is subject to the terms and conditions defined in LICENSE file,
 # which is part of this source code package.
 
-import yaml, csv, shutil, tempfile, datetime, getopt, re, sys, os
-from collections import OrderedDict, namedtuple
+import yaml, csv, tempfile, datetime, getopt, re, os, sys
+from collections import namedtuple
 
-# Placeholder region code used when particular location has no region specified.
-# Shouldn't match any of subdivision codes defined by ISO 3166-2
-UNKNOWN_REGION_CODE = ".NONE"
-DEFAULT_OUTPUT_BASENAME = "country"
-PARSER_HINT_TAG = "flags"
-TODO_MARKER = "(TODO)"
-PROJECT_HOMEPAGE = "https://github.com/sergeuz/locode"
-VERSION_STRING = "0.1.0"
-
-# Supported parser hints
-PARSER_HINT_PRESERVE = "preserve"
-PARSER_HINT_ODD = "odd" # Not recognized actually, see "Document structure"
+import locode
+from locode import print_q, print_v
 
 class Config:
     def __init__(self):
         # Default settings
         self.src_files = []
-        self.dest_path = DEFAULT_OUTPUT_BASENAME
+        self.dest_path = locode.DEFAULT_OUTPUT_BASENAME
         self.dest_is_file = False
         self.ctry_codes = set() # Country codes
         self.replace = False
@@ -37,9 +28,7 @@ class Config:
         self.simplify = False
         self.no_obs = False
         self.no_diacr = False
-        self.add_descr = False
-        self.verbose = False
-        self.quiet = False
+        self.add_info = False
         self.safe_args = []
         self.safe_src_files = []
 
@@ -110,7 +99,7 @@ Arguments:
     --no-diacritic
         Use location names without diacritic signs.
 
-    --add-description
+    --add-info
         Put description of document structure into header of generated YAML
         files. Can be useful for those who will edit these files manually.
 
@@ -147,145 +136,99 @@ Examples:
         Merge all YAML files found in current directory into single file. All
         content of destination file will be overwritten (see -r flag).
 """.format(
-    homepage=PROJECT_HOMEPAGE,
-    version=VERSION_STRING,
-    basename=DEFAULT_OUTPUT_BASENAME))
-
-
-def print_q(*objs):
-    if not cfg.quiet:
-        print(*objs)
-
-
-def print_v(*objs):
-    if cfg.verbose:
-        print_q(*objs)
-
-
-def simplify_str(s):
-    return ' '.join(s.split())
-
-
-def is_upper_str(s):
-    for c in s:
-        if c.isalpha() and not c.istitle():
-            return False
-    return True
-
-
-def transact_copy(src_dir, dest_dir):
-    files = []
-    # At first step checking if we actually can write all our destination files
-    for name in os.listdir(src_dir):
-        src_file = os.path.abspath(src_dir + '/' + name)
-        if not os.path.isfile(src_file):
-            continue
-        dest_file = os.path.abspath(dest_dir + '/' + name)
-        if not os.path.exists(dest_file) or os.path.isfile(dest_file) and os.access(dest_file, os.W_OK):
-            files.append((src_file, dest_file))
-        else:
-            raise RuntimeError("Unable to write to file: {}".format(dest_file))
-    # Copying files
-    for src_file, dest_file in files:
-        if os.path.exists(dest_file):
-            if cfg.replace:
-                print_q("Replacing file:", dest_file)
-            else:
-                print_q("Updating file:", dest_file) # Actually we always overwrite files
-        else:
-            print_q("Creating file:", dest_file)
-        shutil.copyfile(src_file, dest_file)
+    version=locode.VERSION_STRING,
+    homepage=locode.PROJECT_HOMEPAGE,
+    basename=locode.DEFAULT_OUTPUT_BASENAME))
 
 
 def parse_cmd_args(argv):
-        global cfg
+    global cfg
 
-        # Parse supported arguments
-        args, cfg.src_files = getopt.getopt(argv[1:], \
-            "c:o:rmsvqh", \
-            ["country=", "output=", "replace", "merge", "simplify", "verbose", "quiet", "help", \
-            "no-obsolete", "no-diacritic", "add-description", "version"]) # No short alternatives
+    args, cfg.src_files = getopt.getopt(argv[1:], \
+        "c:o:rmsvqh", \
+        ["country=", "output=", "replace", "merge", "simplify", "verbose", "quiet", "help", \
+        "no-obsolete", "no-diacritic", "add-info", "version"]) # No short alternatives
 
-        # Arguments we don't want to disclose, see save_yml_file()
-        param_unsafe = ["-o", "--output", "-v", "--verbose", "-q", "--quiet"]
-        # Arguments not supported in merge mode. Just to warn those who expects the opposite
-        param_no_merge = ["-s", "--simplify", "--no-obsolete", "--no-diacritic"]
+    # Arguments we don't want to disclose, see save_yml_file()
+    param_unsafe = ["-o", "--output", "-v", "--verbose", "-q", "--quiet"]
+    # Arguments not supported in merge mode. Just to warn those who expects the opposite
+    param_no_merge = ["-s", "--simplify", "--no-obsolete", "--no-diacritic"]
 
-        for param, val in args:
-            if param in ("-h", "--help"):
-                print_usage();
-                sys.exit();
-            elif param == "--version":
-                print(VERSION_STRING);
-                sys.exit();
-            elif param in ("-c", "--country"):
-                for code in val.split(','):
-                    code = code.strip()
-                    if len(code) == 2:
-                        cfg.ctry_codes.add(code.upper())
-                    elif code:
-                        sys.stderr.write("Warning: \"{}\" doesn't look like ISO 3166-1 country code\n".format(code))
-            elif param in ("-o", "--output"):
-                cfg.dest_path = val
-            elif param in ("-r", "--replace"):
-                cfg.replace = True
-            elif param in ("-m", "--merge"):
-                cfg.merge = True
-            elif param in ("-s", "--simplify"):
-                cfg.simplify = True
-            elif param in ("-v", "--verbose"):
-                cfg.verbose = True
-            elif param in ("-q", "--quiet"):
-                cfg.quiet = True
-            elif param == "--no-obsolete":
-                cfg.no_obs = True
-            elif param == "--no-diacritic":
-                cfg.no_diacr = True
-            elif param == "--add-description":
-                cfg.add_descr = True
-            else:
-                assert False
-
-            # See save_yml_file()
-            if param not in param_unsafe:
-                cfg.safe_args.append(param)
-                if val:
-                    cfg.safe_args.append(val)
-
-        if cfg.merge:
-            for param, _ in args:
-                if param in param_no_merge:
-                    sys.stderr.write("Warning: \"{}\" has no effect in merge mode\n".format(param))
-
-        # Converting source files to absolute paths
-        for i, v in enumerate(cfg.src_files):
-            cfg.src_files[i] = os.path.abspath(v)
-            cfg.safe_src_files.append(os.path.basename(v)) # Hide path
-
-        if len(cfg.src_files) > 1:
-            print_q("Source files:")
-            for file_name in cfg.src_files:
-                print_q("    {}".format(file_name))
-        elif len(cfg.src_files) == 1:
-            print_q("Source file:", cfg.src_files[0])
+    for param, val in args:
+        if param in ("-h", "--help"):
+            print_usage();
+            sys.exit();
+        elif param == "--version":
+            print(locode.VERSION_STRING);
+            sys.exit();
+        elif param in ("-c", "--country"):
+            for code in val.split(','):
+                code = code.strip()
+                if len(code) == 2:
+                    cfg.ctry_codes.add(code.upper())
+                elif code:
+                    sys.stderr.write("Warning: \"{}\" doesn't look like ISO 3166-1 country code\n".format(code))
+        elif param in ("-o", "--output"):
+            cfg.dest_path = val
+        elif param in ("-r", "--replace"):
+            cfg.replace = True
+        elif param in ("-m", "--merge"):
+            cfg.merge = True
+        elif param in ("-s", "--simplify"):
+            cfg.simplify = True
+        elif param == "--no-obsolete":
+            cfg.no_obs = True
+        elif param == "--no-diacritic":
+            cfg.no_diacr = True
+        elif param == "--add-info":
+            cfg.add_info = True
+        elif param in ("-v", "--verbose"):
+            locode.verbose = True # See locode.py
+        elif param in ("-q", "--quiet"):
+            locode.quiet = True # See locode.py
         else:
-            raise RuntimeError("No input files specified.\nTry 'loc2yaml --help' for list of supported options.")
+            assert False
 
-        # Full path to destination file or directory
-        cfg.dest_path = os.path.abspath(cfg.dest_path)
-        if cfg.merge or os.path.isfile(cfg.dest_path) or cfg.dest_path.endswith(".yaml"):
-            if not cfg.dest_path.endswith(".yaml"):
-                cfg.dest_path += ".yaml"
-            print_q("Destination file:", cfg.dest_path)
-            cfg.dest_is_file = True;
-        else:
-            print_q("Destination directory:", cfg.dest_path)
+        # See save_yml_file()
+        if param not in param_unsafe:
+            cfg.safe_args.append(param)
+            if val:
+                cfg.safe_args.append(val)
 
-        # Country codes filter
-        if cfg.ctry_codes:
-            print_q("Country codes:", ", ".join(sorted(cfg.ctry_codes)))
-        else:
-            print_q("Using all country codes")
+    if cfg.merge:
+        for param, _ in args:
+            if param in param_no_merge:
+                sys.stderr.write("Warning: \"{}\" has no effect in merge mode\n".format(param))
+
+    # Converting source files to absolute paths
+    for i, v in enumerate(cfg.src_files):
+        cfg.src_files[i] = os.path.abspath(v)
+        cfg.safe_src_files.append(os.path.basename(v)) # Hide path
+
+    if len(cfg.src_files) > 1:
+        print_q("Source files:")
+        for file_name in cfg.src_files:
+            print_q("    {}".format(file_name))
+    elif len(cfg.src_files) == 1:
+        print_q("Source file:", cfg.src_files[0])
+    else:
+        raise RuntimeError("No input files specified.\nTry 'loc2yaml --help' for list of supported options.")
+
+    # Full path to destination file or directory
+    cfg.dest_path = os.path.abspath(cfg.dest_path)
+    if cfg.merge or os.path.isfile(cfg.dest_path) or cfg.dest_path.endswith(".yaml"):
+        if not cfg.dest_path.endswith(".yaml"):
+            cfg.dest_path += ".yaml"
+        print_q("Destination file:", cfg.dest_path)
+        cfg.dest_is_file = True;
+    else:
+        print_q("Destination directory:", cfg.dest_path)
+
+    # Country filter
+    if cfg.ctry_codes:
+        print_q("Country code(s):", ", ".join(sorted(cfg.ctry_codes)))
+    else:
+        print_q("Using all country codes")
 
 
 def simplify_name(orig_name):
@@ -303,7 +246,7 @@ def simplify_name(orig_name):
     # "Saint Petersburg (ex Leningrad)" -> "Saint Petersburg"
     for re in re_cut:
         loc_name = re.sub('', loc_name)
-    loc_name = simplify_str(loc_name)
+    loc_name = locode.simplify_str(loc_name)
 
     # Always using last name met among possible renamings and alternatives.
     # Sometimes this seems to give an advance to French namings in case of
@@ -311,13 +254,13 @@ def simplify_name(orig_name):
     # "Peking = Beijing" -> "Beijing"
     loc_names = loc_name.split('=')
     if len(loc_names) > 1:
-        loc_name = simplify_str(loc_names[-1])
+        loc_name = locode.simplify_str(loc_names[-1])
 
     # Some names consist of comma-separated parts and situations when this
     # rule is applied seem to be completely random regardless of what is
     # said in manual. Here we just merging such parts
     loc_name = loc_name.replace(',', '')
-    loc_name = simplify_str(loc_name)
+    loc_name = locode.simplify_str(loc_name)
 
     # Skipping subordinate entries, e.g. "London-Heathrow Apt" (for what
     # they're used if there are also sublocation entries?). These ones are
@@ -374,9 +317,9 @@ def parse_csv_file(file_name, out_dict):
             continue
         # Location name
         if cfg.no_diacr:
-            loc_name = simplify_str(row[4]) # Name without diacritic signs
+            loc_name = locode.simplify_str(row[4]) # Name without diacritic signs
         else:
-            loc_name = simplify_str(row[3])
+            loc_name = locode.simplify_str(row[3])
         region_code = row[5].strip().upper() # Subdivision code
         loc_code = row[2].strip().upper() # Location code
         status = row[7].strip().casefold() # Approval status
@@ -387,7 +330,7 @@ def parse_csv_file(file_name, out_dict):
 
         orphane = False
         if not region_code:
-            region_code = UNKNOWN_REGION_CODE
+            region_code = locode.UNKNOWN_REGION_CODE
             orphane = True
 
         full_code = ctry_code + ' ' + region_code + ' ' + loc_code
@@ -446,49 +389,7 @@ def parse_csv_file(file_name, out_dict):
             print_v("    {}: {}".format(code, "; ".join(sorted(names))))
 
 
-def parse_yml_file(file_name, yml_dest):
-    print_q("Loading file:", file_name)
-    f = open(file_name, 'r')
-    yml_src = yaml.safe_load(f)
-    f.close()
-
-    if "country" not in yml_src:
-        sys.stderr.write("Warning: No country data found, skipping file\n")
-        return
-
-    # Checking if all codes are provided in upper case. Helps mostly with loc2yaml
-    # debugging when certain unquoted node names, such as 'NO' (Norway), are being
-    # converted to other Python types by pyyaml's safe_load() parser, rather than
-    # being represented as strings
-    src_ctry_root = yml_src["country"]
-    for ctry_code, src_ctry in src_ctry_root.items():
-        if len(ctry_code) != 2:
-            sys.stderr.write("Warning: Invalid country code: {}\n".format(ctry_code))
-            continue
-        if not is_upper_str(ctry_code):
-            sys.stderr.write("Warning: Country code contains mixed case letters: {}\n".format(ctry_code))
-        if "region" in src_ctry:
-            for region_code, src_region in src_ctry["region"].items():
-                if not is_upper_str(region_code):
-                    sys.stderr.write("Warning: Region code contains mixed case letters: {}\n".format(region_code))
-                if "city" in src_region:
-                    for city_code in src_region["city"].keys():
-                        if not is_upper_str(city_code):
-                            sys.stderr.write("Warning: City code contains mixed case letters: {}\n".format(city_code))
-
-    if cfg.ctry_codes:
-        # Filtering content by country codes
-        dest_ctry_root = yml_dest["country"]
-        for ctry_code in src_ctry_root:
-            if ctry_code in cfg.ctry_codes: # Upper-case expected
-                dest_ctry_root.setdefault(ctry_code, {}).update(src_ctry_root[ctry_code])
-            else:
-                continue
-    else:
-        yml_dest.update(yml_src)
-
-
-def update_yml_data(yml_data, csv_data):
+def update_yml_data(yml_root, csv_data):
     # Update statistics
     stat_add = []
     stat_del = []
@@ -496,7 +397,7 @@ def update_yml_data(yml_data, csv_data):
     stat_conf = []
     stat_todo = False
 
-    yml_ctry_root = yml_data["country"]
+    yml_ctry_root = yml_root["country"]
     for csv_ctry_code, csv_region_root in csv_data.items():
         # YAML's city properties for current country
         yml_city_prop = {}
@@ -530,8 +431,8 @@ def update_yml_data(yml_data, csv_data):
 
                 # Hint flags for loc2yaml, e.g. ".loc2yaml: preserve"
                 flags = set()
-                if type(yml_city) == type({}) and PARSER_HINT_TAG in yml_city:
-                    for flag in yml_city[PARSER_HINT_TAG].split(','):
+                if type(yml_city) == type({}) and locode.PARSER_HINT_TAG in yml_city:
+                    for flag in yml_city[locode.PARSER_HINT_TAG].split(','):
                         flag = flag.strip().casefold()
                         if flag:
                             flags.add(flag)
@@ -542,7 +443,7 @@ def update_yml_data(yml_data, csv_data):
         # Providing placeholder for default country name if necessary
         if "name" not in yml_ctry or not yml_ctry["name"]:
             # TODO: Actually original CSV files seem to contain country names in English
-            yml_ctry["name"] = csv_ctry_code.capitalize() + ' ' + TODO_MARKER
+            yml_ctry["name"] = csv_ctry_code.capitalize() + ' ' + locode.TODO_MARKER
             stat_todo = True # Some names need to be provided externally
 
         # Adding new locations; filling default names
@@ -550,10 +451,10 @@ def update_yml_data(yml_data, csv_data):
         for csv_region_code, csv_city_root in csv_region_root.items():
             yml_region = yml_region_root.setdefault(csv_region_code, {})
             if "name" not in yml_region or not yml_region["name"]:
-                if csv_region_code == UNKNOWN_REGION_CODE:
-                    yml_region["name"] = "Unknown " + TODO_MARKER
+                if csv_region_code == locode.UNKNOWN_REGION_CODE:
+                    yml_region["name"] = "Unknown " + locode.TODO_MARKER
                 else:
-                    yml_region["name"] = csv_region_code.capitalize() + ' ' + TODO_MARKER # Cannot know full region name
+                    yml_region["name"] = csv_region_code.capitalize() + ' ' + locode.TODO_MARKER # Cannot know full region name
                 stat_todo = True
 
             yml_city_root = yml_region.setdefault("city", {})
@@ -580,12 +481,12 @@ def update_yml_data(yml_data, csv_data):
                     yml_city = yml_city_prop[csv_loc_code]
                     full_code_yml = csv_ctry_code + ' ' + yml_city.region + ' ' + csv_loc_code
                     full_code_csv = csv_ctry_code + ' ' + csv_region_code + ' ' + csv_loc_code
-                    if yml_city.region == UNKNOWN_REGION_CODE:
-                        if PARSER_HINT_PRESERVE not in yml_city.flags:
+                    if yml_city.region == locode.UNKNOWN_REGION_CODE:
+                        if locode.PARSER_HINT_PRESERVE not in yml_city.flags:
                             # Moving YAML's city to another region only if its current region is not specified
                             yml_city_root[csv_loc_code] = yml_region_root[yml_city.region]["city"].pop(csv_loc_code)
                             stat_moved.append((full_code_yml, full_code_csv, yml_city.name)) # Update statistics
-                    elif csv_region_code != UNKNOWN_REGION_CODE:
+                    elif csv_region_code != locode.UNKNOWN_REGION_CODE:
                         # CSV and YAML contain same location in different regions
                         stat_conf.append((full_code_yml, full_code_csv, yml_city.name))
                 else:
@@ -597,7 +498,7 @@ def update_yml_data(yml_data, csv_data):
         # Removing obsolete locations if requested
         if cfg.no_obs:
             for yml_city_code, yml_city in yml_city_prop.items():
-                if yml_city_code not in csv_loc_prop and PARSER_HINT_PRESERVE not in yml_city.flags:
+                if yml_city_code not in csv_loc_prop and locode.PARSER_HINT_PRESERVE not in yml_city.flags:
                     del yml_region_root[yml_city.region]["city"][yml_city_code]
                     full_code = csv_ctry_code + ' ' + yml_city.region + ' ' + yml_city_code
                     stat_del.append((full_code, yml_city.name)) # Update statistics
@@ -605,30 +506,7 @@ def update_yml_data(yml_data, csv_data):
     return UpdateStat(added=stat_add, deleted=stat_del, moved=stat_moved, conflict=stat_conf, todo=stat_todo)
 
 
-def arrange_yml_nodes(yml_data):
-    if type(yml_data) != type({}):
-        return yml_data;
-
-    # Nodes to appear at first place
-    head = ["name", "default", PARSER_HINT_TAG]
-    # And ones to be placed at the end
-    tail = ["region", "city", UNKNOWN_REGION_CODE]
-
-    res = OrderedDict()
-    for key in head:
-        if key in yml_data:
-            res[key] = arrange_yml_nodes(yml_data[key])
-    for key, val in sorted(yml_data.items()): # Other nodes come in sorted order
-        if key not in head and key not in tail:
-            res[key] = arrange_yml_nodes(val)
-    for key in tail:
-        if key in yml_data:
-            res[key] = arrange_yml_nodes(yml_data[key])
-
-    return res
-
-
-def save_yml_file(yml_data, file_name):
+def save_yml_file(yml_root, file_name):
     f = open(file_name, 'w', encoding="utf-8", newline='\n')
 
     # Header text
@@ -643,14 +521,14 @@ def save_yml_file(yml_data, file_name):
 # UN/LOCODE homepage:
 # http://www.unece.org/cefact/locode/welcome.html
 """.format(
-    version=VERSION_STRING,
-    homepage=PROJECT_HOMEPAGE,
+    version=locode.VERSION_STRING,
+    homepage=locode.PROJECT_HOMEPAGE,
     timestamp=datetime.datetime.utcnow().strftime("%Y-%m-%d, %H:%M:%S"),
     args=' '.join(cfg.safe_args),
-    files=";\n# ".join(cfg.safe_src_files)))
+    files=";\n#   ".join(cfg.safe_src_files)))
 
     # Some hints for those who will update file manually
-    if cfg.add_descr:
+    if cfg.add_info:
         f.write("""#
 # Document structure (http://en.wikipedia.org/wiki/YAML):
 #
@@ -714,15 +592,14 @@ def save_yml_file(yml_data, file_name):
 #   entries for target applications. Being simply removed such entries likely
 #   will be restored on next updating invocation of loc2yaml.
 """.format(
-    no_region=UNKNOWN_REGION_CODE,
-    todo=TODO_MARKER,
-    hint_tag=PARSER_HINT_TAG,
-    hint_preserve=PARSER_HINT_PRESERVE,
-    hint_odd=PARSER_HINT_ODD))
+    no_region=locode.UNKNOWN_REGION_CODE,
+    todo=locode.TODO_MARKER,
+    hint_tag=locode.PARSER_HINT_TAG,
+    hint_preserve=locode.PARSER_HINT_PRESERVE,
+    hint_odd=locode.PARSER_HINT_ODD))
 
     f.write('\n')
-    f.write(yaml.safe_dump(arrange_yml_nodes(yml_data), # Order YAML nodes in specific manner
-        allow_unicode=True, default_flow_style=False))
+    locode.write_yml_data(yml_root, f)
     f.close()
 
 
@@ -762,12 +639,12 @@ def do_gen():
             yml_files.append(cfg.dest_path)
 
     # Parsing all YAML files into single dictionary
-    yml_data = {"country": {}}
+    yml_root = {"country": {}}
     for file_name in yml_files:
-        parse_yml_file(file_name, yml_data)
+        locode.parse_yml_file(file_name, yml_root, ctry_codes)
 
     print_q("Generating data...")
-    stat = update_yml_data(yml_data, csv_data) # Go!
+    stat = update_yml_data(yml_root, csv_data) # Go!
 
     # Ensure destination path is exist
     dest_path = cfg.dest_path
@@ -783,16 +660,16 @@ def do_gen():
 
     if not cfg.dest_is_file:
         # Saving each country data into separate YAML file
-        for ctry_code, yml_ctry in yml_data["country"].items():
+        for ctry_code, yml_ctry in yml_root["country"].items():
             if len(ctry_code) != 2:
                 continue # Strange country entries are not going to be saved as separate file
             save_yml_file({"country": {ctry_code: yml_ctry}}, temp_dir.name + '/' + ctry_code.lower() + ".yaml")
     else:
         # Saving everything into single YAML file
-        save_yml_file(yml_data, temp_dir.name + '/' + os.path.basename(cfg.dest_path))
+        save_yml_file(yml_root, temp_dir.name + '/' + os.path.basename(cfg.dest_path))
 
     # Finally copying all generated files into specified destination directory
-    transact_copy(temp_dir.name, dest_path)
+    locode.transact_copy(temp_dir.name, dest_path, cfg.replace)
 
     # Printing update summary
     if yml_files:
@@ -814,7 +691,7 @@ def do_gen():
                 print_v("    {}, {} (UN/LOCODE): {}".format(code_yml, code_csv, name))
     if stat.todo:
         sys.stderr.write("""Warning: Some entry names are missing and should be provided manually, search
-for {} marker in generated file contents.\n""".format(TODO_MARKER))
+for {} marker in generated file contents.\n""".format(locode.TODO_MARKER))
 
     if stat.added:
         print_q("Summary: Added {} new location(s)".format(len(stat.added)))
@@ -828,7 +705,7 @@ def do_merge():
     # Parsing all YAML files into single dictionary
     yml_src_data = {"country": {}}
     for file_name in cfg.src_files:
-        parse_yml_file(file_name, yml_src_data)
+        locode.parse_yml_file(file_name, yml_src_data, cfg.ctry_codes)
 
     if cfg.ctry_codes:
         missing = cfg.ctry_codes - yml_src_data["country"].keys()
@@ -837,7 +714,7 @@ def do_merge():
 
     if not cfg.replace and os.path.isfile(cfg.dest_path):
         yml_dest_data = {"country": {}}
-        parse_yml_file(cfg.dest_path, yml_dest_data)
+        locode.parse_yml_file(cfg.dest_path, yml_dest_data, cfg.ctry_codes)
         print_q("Merging data...")
         yml_dest_data.update(yml_src_data)
     else:
@@ -857,43 +734,13 @@ def do_merge():
     save_yml_file(yml_dest_data, temp_dir.name + '/' + os.path.basename(cfg.dest_path))
 
     # Finally copying all generated files into specified destination directory
-    transact_copy(temp_dir.name, dest_path)
-
-
-# Representer function for pyyaml used to dump OrderedDict objects. Basically a
-# copy-paste of BaseRepresenter.represent_mapping() without using sort()
-def represent_odict(dump, tag, mapping, flow_style = None):
-    value = []
-    node = yaml.MappingNode(tag, value, flow_style=flow_style)
-    if dump.alias_key is not None:
-        dump.represented_objects[dump.alias_key] = node
-    best_style = True
-    if hasattr(mapping, 'items'):
-        mapping = mapping.items()
-    for item_key, item_value in mapping:
-        node_key = dump.represent_data(item_key)
-        node_value = dump.represent_data(item_value)
-        if not (isinstance(node_key, yaml.ScalarNode) and not node_key.style):
-            best_style = False
-        if not (isinstance(node_value, yaml.ScalarNode) and not node_value.style):
-            best_style = False
-        value.append((node_key, node_value))
-    if flow_style is None:
-        if dump.default_flow_style is not None:
-            node.flow_style = dump.default_flow_style
-        else:
-            node.flow_style = best_style
-    return node
+    locode.transact_copy(temp_dir.name, dest_path, cfg.replace)
 
 
 def main(argv):
     try:
         # Parsing command-line arguments
         parse_cmd_args(argv)
-
-        # Installing our custom representer for OrderedDict objects
-        yaml.SafeDumper.add_representer(OrderedDict,
-            lambda dump, val: represent_odict(dump, "tag:yaml.org,2002:map", val))
 
         if not cfg.merge:
             do_gen() # Parse CSV files and create/update YAML files
