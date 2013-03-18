@@ -1,11 +1,14 @@
 This project is an attempt to provide and maintain internationalized database
-of world countries, their regions, cities and other localities. Contains
-loc2yaml, CSV to YAML converter tool for UN/LOCODE data, which is chosen as
-foundation for such database.
+of world countries, their regions, cities and other localities.
+
+Contains 'loc2yaml', CSV to YAML converter tool for UN/LOCODE data, which is
+chosen as foundation for locations database. Helper tool called 'loctrans',
+allowing to generate initial translations to different languages is provided
+as well (uses Google Translate service).
 
 UN/LOCODE homepage:
 http://www.unece.org/cefact/locode/welcome.html
-Recent CSV files can be downloaded here:
+Recent CSV files with locations data can be downloaded here:
 http://www.unece.org/cefact/codesfortrade/codes_index.html
 
 Examples of loc2yaml usage:
@@ -25,6 +28,18 @@ loc2yaml -o world.yaml *.csv
 loc2yaml -m -r -o world.yaml *.yaml
     Merge all YAML files found in current directory into single file. All
     content of destination file will be overwritten (see -r flag).
+
+Examples of loctrans usage:
+
+loctrans -k GOOGLE_API_KEY -t uk -o dest/ua.yaml src/ua.yaml
+    Generate translations for Ukrainian language and save results as separate
+    file. Default translations will be used as source texts.
+
+loctrans -k GOOGLE_API_KEY -c ru -s en -t ru world.yaml
+    Assuming 'world.yaml' contains location data for several countries, generate
+    translations only for Russia (target language is also Russian) and update
+    original YAML file. Existent English translations will be used as source
+    texts when possible.
 
 Structure of generated documents:
 
