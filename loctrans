@@ -10,11 +10,16 @@
 # This file is subject to the terms and conditions defined in LICENSE file,
 # which is part of this source code package.
 
-import yaml, json, urllib.request, urllib.parse, tempfile, getopt, time, re, copy, os, sys
+import yaml, json, urllib.request, urllib.parse, tempfile, getopt, re, copy, os, sys
 from collections import OrderedDict, namedtuple
 
 import locode
 from locode import print_q, print_v
+
+# Certain definitions of Google Translate API
+API_URL_BASE = "https://www.googleapis.com/language/translate/v2"
+API_MAX_URL_LENGTH = 2000
+API_MAX_REQUEST_ENTRIES = 128
 
 class Config:
     def __init__(self):
@@ -27,9 +32,11 @@ class Config:
         self.src_lang = None
         self.dest_langs = set()
         self.api_key = None
+        self.retry = False
         self.force = False
 
 # Helper structures
+TransResult = namedtuple('TransResult', ['items', 'skipped'])
 NameItem = namedtuple('NameItem', ['name', 'lang'])
 TransItemTuple = namedtuple('TransItemTuple', ['name', 'lang', 'country', 'region', 'city'])
 def TransItem(name, lang=None, country=None, region=None, city=None):
@@ -112,7 +119,7 @@ def print_usage():
 {homepage}
 
 Usage:
-    loctrans -k key [-c code] -d language -t language [-o file.yaml] file.yaml
+    loctrans -k key [-c code] -t language [-o file.yaml] file.yaml
 
 Arguments:
     -k key
@@ -124,7 +131,8 @@ Arguments:
         Language of default name translations provided in YAML file. Two-letter
         codes as defined in ISO 639-1 are recognized. Default translations are
         usually given in national language of particular country (see UN/LOCODE
-        manual).
+        manual). Google Translate will try to autodetect language if necessary,
+        but it's recommended to always specify default language.
 
     -s code
     --source=code
@@ -149,10 +157,24 @@ Arguments:
     -o file
     --output=file
         Destination file to save updated YAML contents. Original file will be
-        updated if not custom file specified.
+        updated if no custom file specified.
+
+    --retry
+        For better performance requests sent to Google Translate service contain
+        batch of entries for translation. Same time particular request may be
+        rejected with all its contents, for example, when service is unable to
+        determine source language. This parameter allows to split failed batch
+        request into separate requests, trying to translate original entries
+        one by one.
 
     --force
         Don't ask any questions while processing.
+
+    -v
+    --verbose
+        Print various statistics while processing data. It's recommended to
+        enable this option for large datasets, especially when using language
+        autodetection.
 
     -q
     --quiet
@@ -184,9 +206,9 @@ def parse_cmd_args(argv):
     global cfg
 
     args, src_files = getopt.getopt(argv[1:], \
-        "k:c:r:d:s:t:o:qh", \
-        ["key=", "country=", "region=", "default=", "source=", "target=", "output=", "quiet", "help", \
-        "force", "version"]) # No short alternatives
+        "k:c:r:d:s:t:o:vqh", \
+        ["key=", "country=", "region=", "default=", "source=", "target=", "output=", "verbose", "quiet", "help", \
+        "retry", "force", "version"]) # No short alternatives
 
     for param, val in args:
         if param in ("-h", "--help"):
@@ -218,11 +240,15 @@ def parse_cmd_args(argv):
             cfg.dest_file = val
         elif param in ("-k", "--key"):
             cfg.api_key = val
+        elif param in ("-v", "--verbose"):
+            locode.verbose = True # See locode.py
         elif param in ("-q", "--quiet"):
             locode.quiet = True # See locode.py
             cfg.force = True # Implies --force
         elif param == "--force":
             cfg.force = True
+        elif param == "--retry":
+            cfg.retry = True
         else:
             assert False
 
@@ -234,8 +260,6 @@ def parse_cmd_args(argv):
     else:
         raise RuntimeError("No input file specified.\nTry 'loctrans --help' for list of supported options.")
 
-    if not cfg.def_lang:
-        raise RuntimeError("Default language is not specified.")
     if not cfg.dest_langs:
         raise RuntimeError("No target language(s) specified.")
 
@@ -413,6 +437,27 @@ def update_trans_items(yml_root, trans_items):
             yml_ctry_root[trans_item.country] = updated_name_item(yml_ctry, name_item) # Country name
 
 
+def is_lang_pair_error(error):
+    if error.code == 400:
+        resp = locode.simplify_str(error.read().decode("utf-8")).casefold()
+        return resp.find("bad language pair") > -1
+    else:
+        return False
+
+
+def parse_api_resp(resp):
+    if resp.status != 200:
+        raise RuntimeError("Unexpected HTTP response: {} ({})".format(resp.reason, resp.status))
+    # Parse JSON, preserving order of elements
+    js = json.loads(resp.read().decode("utf-8"), object_pairs_hook=OrderedDict)
+    if not "data" in js or not "translations" in js["data"]:
+        raise RuntimeError("Unexpected response data.")
+    texts = []
+    for t in js["data"]["translations"]:
+        texts.append(t["translatedText"])
+    return texts
+
+
 def do_trans(items, dest_lang):
     # Group items by source language
     items_by_lang = {}
@@ -420,55 +465,69 @@ def do_trans(items, dest_lang):
         items_by_lang.setdefault(item.lang, []).append(item)
 
     dest_items = []
+    skipped_names = []
     for src_lang, src_items in items_by_lang.items():
         while src_items:
-            url_base = "https://www.googleapis.com/language/translate/v2"
+            if dest_items or skipped_names:
+                print_v("{} ({}): Translated {} entries ({} errors)...".format(
+                    supp_langs[dest_lang], dest_lang, len(dest_items), len(skipped_names)))
+
             get_params = [
                 ("key", cfg.api_key),
                 ("target", dest_lang),
                 ("format", "text")]
-
-            # Google Translate will try to autodetect source language if missing
             if src_lang:
                 get_params.append(("source", src_lang))
 
-            url = url_base + '?' + urllib.parse.urlencode(get_params)
+            url_base = API_URL_BASE + '?' + urllib.parse.urlencode(get_params)
+
+            url = url_base
             req_items = []
-            while src_items and len(req_items) < 128: # Avoid "Too many text segments" error
+            while src_items and len(req_items) < API_MAX_REQUEST_ENTRIES: # Avoid "Too many text segments" error
                 q = '&' + urllib.parse.urlencode({"q": src_items[0].name})
-                if len(url + q) < 2000: # Maximum URL length is also limited
+                if len(url + q) < API_MAX_URL_LENGTH: # Maximum URL length is also limited
                     url += q
                     req_items.append(src_items.pop(0))
                 else:
                     break
 
-            # Sending request
             # TODO: Taking in account that translation is a paid service, would be
-            # good to preserve already translated entries regardless of errors,
+            # good to preserve already translated entries regardless of any errors,
             # which may happen while processing further requests
-            time.sleep(1)
             try:
                 resp = urllib.request.urlopen(url)
             except urllib.error.HTTPError as e:
                 # Checking some special cases here
-                resp = locode.simplify_str(e.read().decode("utf-8")).casefold()
-                if e.code == 400 and resp.find("bad language pair") > -1:
-                    # Shouldn't happen after '-d' argument was made mandatory
-                    raise RuntimeError("""Google Translate is unable to determine source language automatically,
-please, try to change default and/or source languages (see -d and -s arguments).""")
-                raise e
+                if is_lang_pair_error(e):
+                    if cfg.retry:
+                        # Trying to split failed request and translate its entries one by one
+                        for src_item in req_items:
+                            try:
+                                url = url_base + '&' + urllib.parse.urlencode({"q": src_item.name})
+                                resp = urllib.request.urlopen(url)
+                                dest_names = parse_api_resp(resp)
+                                if len(dest_names) != 1:
+                                    raise RuntimeError("Response contains unexpected number of elements.")
+                                dest_items.append(TransItem(
+                                    name=dest_names[0],
+                                    lang=dest_lang,
+                                    country=src_item.country,
+                                    region=src_item.region,
+                                    city=src_item.city))
+                            except urllib.error.HTTPError as e:
+                                if is_lang_pair_error(e):
+                                    skipped_names.append(src_item.name)
+                                else:
+                                    raise e
+                        continue # Proceed with next batch
+                    else:
+                        for src_item in req_items:
+                            skipped_names.append(src_item.name)
+                        continue # Proceed with next batch
+                else:
+                    raise e
 
-            if resp.status != 200:
-                raise RuntimeError("Unexpected HTTP response: {} ({})".format(resp.reason, resp.status))
-
-            # Parse JSON, preserving order of elements
-            js = json.loads(resp.read().decode("utf-8"), object_pairs_hook=OrderedDict)
-            if not "data" in js or not "translations" in js["data"]:
-                raise RuntimeError("Unexpected response data.")
-
-            dest_names = [] # Order of elements matches req_items
-            for t in js["data"]["translations"]:
-                dest_names.append(t["translatedText"])
+            dest_names = parse_api_resp(resp) # Order of elements matches req_items
             if len(dest_names) != len(req_items):
                 raise RuntimeError("Response contains unexpected number of elements.")
 
@@ -481,7 +540,10 @@ please, try to change default and/or source languages (see -d and -s arguments).
                     country=src_item.country,
                     region=src_item.region,
                     city=src_item.city))
-    return dest_items
+
+    print_v("{} ({}): Summary: Translated {} entries ({} errors)".format(
+        supp_langs[dest_lang], dest_lang, len(dest_items), len(skipped_names)))
+    return TransResult(items=dest_items, skipped=skipped_names)
 
 
 def save_yml_file(yml_root, file_name):
@@ -541,9 +603,11 @@ def main(argv):
         # Translating collected names
         print_q("Translating...")
         dest_items = []
+        skipped_names = []
         for dest_lang, items in src_items.items():
-            dest_items += do_trans(items, dest_lang)
-        assert len(dest_items) == total_items
+            trans = do_trans(items, dest_lang)
+            dest_items += trans.items
+            skipped_names += trans.skipped
 
         # Updating YAML data
         update_trans_items(yml_root, dest_items)
@@ -562,7 +626,16 @@ def main(argv):
         save_yml_file(yml_root, temp_dir.name + '/' + os.path.basename(cfg.dest_file))
         locode.transact_copy(temp_dir.name, dest_path)
 
-        print_q("Done.")
+        if skipped_names:
+            sys.stderr.write("""Warning: Translation errors occured while processing some location names. Try
+to change default and source languages if necessary (see -d and -s options).\n""")
+            if cfg.retry:
+                print_v("Skipped location names:", "; ".join(skipped_names))
+            else:
+                 sys.stderr.write("""Additional information can be obtained with '--retry' and '--verbose' options
+enabled.\n""")
+
+        print_q("Summary: Translated {} entries ({} errors)".format(len(dest_items), len(skipped_names)))
 
     except getopt.GetoptError:
         print_usage()
@@ -581,7 +654,7 @@ def main(argv):
         sys.stderr.write("HTTP Error: {} ({})\n".format(e.reason, e.code))
         resp = e.read().decode("utf-8").strip()
         if resp:
-            sys.stderr.write("Response data:\n{}\n".format(data))
+            sys.stderr.write("Response data:\n{}\n".format(resp))
         sys.exit(1)
     except urllib.error.URLError as e:
         sys.stderr.write("Error: {}\n".format(e))
