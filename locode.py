@@ -14,7 +14,7 @@ DEFAULT_OUTPUT_BASENAME = "country"
 PARSER_HINT_TAG = "flags"
 TODO_MARKER = "(TODO)"
 PROJECT_HOMEPAGE = "https://github.com/sergeuz/locode"
-VERSION_STRING = "0.1.0"
+VERSION_STRING = "0.2.0"
 
 # Supported parser hints
 PARSER_HINT_PRESERVE = "preserve"

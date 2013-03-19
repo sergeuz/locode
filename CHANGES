@@ -5,7 +5,10 @@ Legend:
 - Removed functionality
 ! Fixed problem
 
-Changes history (loc2yaml):
+Changes history:
+
+Version: 0.2.0 (19-03-2013)
+* Added loctrans tool;
 
 Version: 0.1.0 (16-03-2013)
 * Initial release.
